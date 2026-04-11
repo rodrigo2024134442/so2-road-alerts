@@ -1,6 +1,28 @@
+#include <windows.h>
+#include <tchar.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <strsafe.h>
+
+#define REG_KEY     _T("Software\\TrabSO2")
+#define REG_VALUE   _T("NPIPE")
+#define MAX_PIPE    256
+
+// Estrutura de novo alerta (igual à usada na comunicação central -> placar)
+typedef struct {
+    BYTE  tipo;       // 4 = novo alerta
+    TCHAR msg[140];
+    DWORD duracao;
+} MSG_ALERTA;
+
+// Handles globais partilhados entre threads
+HANDLE gEventoTerminar = NULL;   // sinalizado quando utilizador escreve "desligar"
+HANDLE gEventoNotificar = NULL;  // evento com nome "notificar" (reset manual)
+TCHAR  gNomePipe[MAX_PIPE];      // nome do pipe lido do Registry / args
 
 // Obtém a hora atual formatada
-void obterHoraFormatada(TCHAR *buf, int bufSize) {
+void obterHoraFormatada(TCHAR* buf, int bufSize) {
     SYSTEMTIME st;
     GetLocalTime(&st);
     StringCchPrintf(buf, bufSize, _T("%02d/%02d/%04d (%02d:%02d:%02d)"),
@@ -9,8 +31,7 @@ void obterHoraFormatada(TCHAR *buf, int bufSize) {
 }
 
 // Lê o nome do pipe do Registry
-
-BOOL lerRegistryNPIPE(TCHAR *buf, DWORD bufSize) {
+BOOL lerRegistryNPIPE(TCHAR* buf, DWORD bufSize) {
     HKEY hKey;
     if (RegOpenKeyEx(
         HKEY_CURRENT_USER, // chave raiz
@@ -36,30 +57,29 @@ BOOL lerRegistryNPIPE(TCHAR *buf, DWORD bufSize) {
 }
 
 // Escreve o nome do pipe no Registry
-
-BOOL escreverRegistryNPIPE(const TCHAR *valor) {
+BOOL escreverRegistryNPIPE(const TCHAR* valor) {
     HKEY hKey;
     DWORD disp;
 
     if (RegCreateKeyEx(
-        HKEY_CURRENT_USER,   // chave raiz
-        REG_KEY,             // subchave
-        0,                   // reservado
-        NULL,                // classe
+        HKEY_CURRENT_USER,       // chave raiz
+        REG_KEY,                 // subchave
+        0,                       // reservado
+        NULL,                    // classe
         REG_OPTION_NON_VOLATILE, // persistente
-        KEY_WRITE,           // permissões
-        NULL,                // segurança
-        &hKey,               // handle
-        &disp                // info criação
+        KEY_WRITE,               // permissões
+        NULL,                    // segurança
+        &hKey,                   // handle
+        &disp                    // info criação
     ) != ERROR_SUCCESS)
         return FALSE;
 
     BOOL ok = (RegSetValueEx(
-        hKey,                         // chave
-        REG_VALUE,                    // nome
-        0,                            // reservado
-        REG_SZ,                       // tipo string
-        (const BYTE *)valor,          // dados
+        hKey,                                          // chave
+        REG_VALUE,                                     // nome
+        0,                                             // reservado
+        REG_SZ,                                        // tipo string
+        (const BYTE*)valor,                            // dados
         (DWORD)((_tcslen(valor) + 1) * sizeof(TCHAR)) // tamanho
     ) == ERROR_SUCCESS);
 
@@ -68,8 +88,7 @@ BOOL escreverRegistryNPIPE(const TCHAR *valor) {
 }
 
 // Lê um alerta do Registry
-
-BOOL lerAlertaRegistry(MSG_ALERTA *alerta) {
+BOOL lerAlertaRegistry(MSG_ALERTA* alerta) {
     HKEY hKey;
 
     if (RegOpenKeyEx(
@@ -83,21 +102,23 @@ BOOL lerAlertaRegistry(MSG_ALERTA *alerta) {
 
     DWORD tipo, tamanho = sizeof(MSG_ALERTA);
     BOOL ok = (RegQueryValueEx(
-        hKey,            // chave
-        gNomePipe,       // nome do valor (pipe)
-        NULL,            // reservado
-        &tipo,           // tipo
-        (LPBYTE)alerta,  // destino
-        &tamanho         // tamanho
+        hKey,           // chave
+        gNomePipe,      // nome do valor (pipe)
+        NULL,           // reservado
+        &tipo,          // tipo
+        (LPBYTE)alerta, // destino
+        &tamanho        // tamanho
     ) == ERROR_SUCCESS);
 
     RegCloseKey(hKey);
     return ok;
 }
 
-
-// Thread que trata dos alertas
-
+// Thread que trata dos alertas:
+//   - espera pelo evento "notificar", waitable timer ou evento de terminação
+//   - ao receber notificar: lê alerta do Registry, mostra, arranca timer
+//   - ao timer disparar: mostra '---'
+//   - ao receber terminação: sai
 DWORD WINAPI threadAlertas(LPVOID param) {
 
     HANDLE hTimer = CreateWaitableTimer(
@@ -107,14 +128,15 @@ DWORD WINAPI threadAlertas(LPVOID param) {
     );
 
     if (!hTimer) {
-        _tprintf(_T("[ERRO] Falha ao criar timer.\n"));
+        _tprintf(_T("[ERRO] Nao foi possivel criar o waitable timer.\n"));
         return 1;
     }
 
+    // Ordem dos handles (importante para interpretar o retorno do Wait)
     HANDLE handles[3] = {
-        gEventoNotificar, // evento de novo alerta
-        hTimer,// timer de alerta
-        gEventoTerminar // evento de terminar
+        gEventoNotificar, // [0] evento de novo alerta
+        hTimer,           // [1] timer de alerta
+        gEventoTerminar   // [2] evento de terminar
     };
 
     TCHAR horaBuf[64];
@@ -128,16 +150,16 @@ DWORD WINAPI threadAlertas(LPVOID param) {
         );
 
         if (ret == WAIT_OBJECT_0) {
-            // Novo alerta
-
+            // Evento "notificar" — ler alerta do Registry
             MSG_ALERTA alerta;
 
             if (lerAlertaRegistry(&alerta)) {
                 obterHoraFormatada(horaBuf, 64);
                 _tprintf(_T("%s: '%s'\n"), horaBuf, alerta.msg);
 
+                // (Re)armar o waitable timer com a duração do alerta
                 LARGE_INTEGER li;
-                li.QuadPart = -(LONGLONG)alerta.duracao * 10000000LL;
+                li.QuadPart = -(LONGLONG)alerta.duracao * 10000000LL; // unidades de 100ns
 
                 SetWaitableTimer(
                     hTimer, // timer
@@ -149,16 +171,16 @@ DWORD WINAPI threadAlertas(LPVOID param) {
                 );
             }
 
+            // Reset manual — temos de fazer ResetEvent explicitamente
             ResetEvent(gEventoNotificar);
 
         } else if (ret == WAIT_OBJECT_0 + 1) {
-            // Timer terminou
-
+            // Waitable timer disparou — alerta expirou
             obterHoraFormatada(horaBuf, 64);
             _tprintf(_T("%s: '---'\n"), horaBuf);
 
         } else {
-            // Terminar
+            // Evento de terminação (ou erro) — sair
             break;
         }
     }
@@ -168,9 +190,8 @@ DWORD WINAPI threadAlertas(LPVOID param) {
     return 0;
 }
 
-
 // Função principal
-int _tmain(int argc, TCHAR *argv[]) {
+int _tmain(int argc, TCHAR* argv[]) {
 
     // Nome do pipe
     if (argc >= 2) {
@@ -178,14 +199,14 @@ int _tmain(int argc, TCHAR *argv[]) {
         escreverRegistryNPIPE(gNomePipe);
     } else {
         if (!lerRegistryNPIPE(gNomePipe, MAX_PIPE)) {
-            _tprintf(_T("[ERRO] Pipe não definido.\n"));
+            _tprintf(_T("[ERRO] Nome do named pipe nao especificado e nao existe no Registry.\n"));
             return 1;
         }
     }
 
     _tprintf(_T("NamedPipe = '%s'\n"), gNomePipe);
 
-    // Evento terminar
+    // Evento de terminação: reset manual, não sinalizado
     gEventoTerminar = CreateEvent(
         NULL,  // segurança
         TRUE,  // reset manual
@@ -193,32 +214,44 @@ int _tmain(int argc, TCHAR *argv[]) {
         NULL   // sem nome
     );
 
-    if (!gEventoTerminar) return 1;
+    if (!gEventoTerminar) {
+        _tprintf(_T("[ERRO] Nao foi possivel criar evento de terminacao.\n"));
+        return 1;
+    }
 
-    // Evento notificar
+    // Evento "notificar": reset manual, não sinalizado, com nome público
     gEventoNotificar = CreateEvent(
-        NULL,        // segurança
-        TRUE,        // reset manual
-        FALSE,       // estado inicial
+        NULL,           // segurança
+        TRUE,           // reset manual
+        FALSE,          // estado inicial
         _T("notificar") // nome
     );
 
-    if (!gEventoNotificar) return 1;
+    if (!gEventoNotificar) {
+        _tprintf(_T("[ERRO] Nao foi possivel abrir/criar evento 'notificar'.\n"));
+        CloseHandle(gEventoTerminar);
+        return 1;
+    }
 
     // Criar thread
     HANDLE hThread = CreateThread(
-        NULL,            // segurança
-        0,               // stack
-        threadAlertas,   // função
-        NULL,            // argumento
-        0,               // flags
-        NULL             // id
+        NULL,          // segurança
+        0,             // stack
+        threadAlertas, // função
+        NULL,          // argumento
+        0,             // flags
+        NULL           // id
     );
 
-    if (!hThread) return 1;
+    if (!hThread) {
+        _tprintf(_T("[ERRO] Nao foi possivel criar thread de alertas.\n"));
+        CloseHandle(gEventoNotificar);
+        CloseHandle(gEventoTerminar);
+        return 1;
+    }
 
     // Loop de comandos
-    TCHAR cmd[64];
+    TCHAR cmd[64] = { 0 };
 
     while (1) {
         if (_tscanf_s(_T("%63s"), cmd, (unsigned)_countof(cmd)) != 1)
@@ -226,16 +259,16 @@ int _tmain(int argc, TCHAR *argv[]) {
 
         if (_tcscmp(cmd, _T("ligar")) == 0) {
             srand((unsigned)time(NULL));
-            int id = rand() % 20 + 1;
+            int id = rand() % 20 + 1; // identificador entre 1 e 20
             _tprintf(_T("Identificador = %d\n"), id);
 
         } else if (_tcscmp(cmd, _T("desligar")) == 0) {
-            SetEvent(gEventoTerminar);
-            WaitForSingleObject(hThread, INFINITE);
+            SetEvent(gEventoTerminar);          // avisar thread de alertas
+            WaitForSingleObject(hThread, INFINITE); // esperar que termine
             break;
 
         } else {
-            _tprintf(_T("Comando inválido\n"));
+            _tprintf(_T("Comando desconhecido. Comandos disponiveis: ligar, desligar\n"));
         }
     }
 
@@ -244,5 +277,6 @@ int _tmain(int argc, TCHAR *argv[]) {
     CloseHandle(gEventoNotificar);
     CloseHandle(gEventoTerminar);
 
+    _tprintf(_T("Placar terminado.\n"));
     return 0;
 }
