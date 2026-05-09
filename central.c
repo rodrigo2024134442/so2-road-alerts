@@ -1,5 +1,11 @@
 ﻿// central.c - SO2 2025/26 - M2
 // gcc -municode -DUNICODE -D_UNICODE -o central.exe central.c
+//
+// Papel do processo Central:
+// - aceita ligações de vários placares via named pipe;
+// - mantém o estado de cada placar;
+// - envia alertas, cancelamentos e encerramento;
+// - usa uma thread por placar para não bloquear a receção.
 #include <windows.h>
 #include <tchar.h>
 #include <stdio.h>
@@ -36,6 +42,7 @@ typedef struct {
     int filaFim;
 } PLACAR_INFO;
 
+/* Estado global do servidor central. */
 static PLACAR_INFO      placares[MAX_PLACARES];
 static DWORD            proximoId = 1;
 static CRITICAL_SECTION csPlacares;
@@ -43,20 +50,23 @@ static BOOL             encerrar  = FALSE;
 static HANDLE           hEventoEncerrar = NULL;
 static TCHAR            nomePipe[256];
 
-/* ---------- helpers ---------- */
+/* ---------- helpers de pesquisa/estado ---------- */
 
+/* Procura um placar pelo handle do pipe associado. */
 static int slotPorPipe(HANDLE h) {
     int i;
     for (i = 0; i < MAX_PLACARES; i++)
         if (placares[i].ativo && placares[i].hPipe == h) return i;
     return -1;
 }
+/* Procura um placar pelo identificador atribuído pela central. */
 static int slotPorId(DWORD id) {
     int i;
     for (i = 0; i < MAX_PLACARES; i++)
         if (placares[i].ativo && placares[i].identificador == id) return i;
     return -1;
 }
+/* Encontra um índice livre na tabela de placares. */
 static int slotLivre(void) {
     int i;
     for (i = 0; i < MAX_PLACARES; i++)
@@ -64,6 +74,8 @@ static int slotLivre(void) {
     return -1;
 }
 
+/* Enfileira uma mensagem para um placar específico.
+    A thread do placar vai consumir esta fila e enviar pela pipe. */
 static BOOL adicionarFilaEnvio(int slot, const MSG_ANY* msg) {
     if (slot < 0 || slot >= MAX_PLACARES) return FALSE;
     int prox = (placares[slot].filaFim + 1) % 50;
@@ -76,6 +88,7 @@ static BOOL adicionarFilaEnvio(int slot, const MSG_ANY* msg) {
     return TRUE;
 }
 
+/* Envio com log de debug para facilitar a defesa e a depuração. */
 static BOOL enviar(HANDLE h, const MSG_ANY* buf) {
     if (h == INVALID_HANDLE_VALUE) {
         _tprintf(_T("[DEBUG] enviar() - handle invalido, descartando tipo=%d\n"), buf->tipo);
@@ -91,6 +104,7 @@ static BOOL enviar(HANDLE h, const MSG_ANY* buf) {
     fflush(stdout);
     return result;
 }
+/* Receção com log de debug. Na prática, o central lê sempre na threadPlacar. */
 static BOOL receberMsg(HANDLE h, MSG_ANY* out) {
     DWORD r;
     _tprintf(_T("[DEBUG] receberMsg() ENTRADA - aguardando leitura..., handle=%p\n"), h);
@@ -103,8 +117,11 @@ static BOOL receberMsg(HANDLE h, MSG_ANY* out) {
 }
 
 /* ---------- thread por placar ----------
-   Trata TODOS os pedidos/confirmacoes deste placar.
-   O central NUNCA faz ReadFile fora desta thread. */
+    Cada ligação ativa tem a sua própria thread.
+    Vantagens:
+    - a leitura fica isolada por placar;
+    - o servidor mantém-se responsivo;
+    - evita bloquear o processamento dos restantes placares. */
 
 static DWORD WINAPI threadPlacar(LPVOID param) {
     HANDLE  hPipe = (HANDLE)param;
@@ -113,10 +130,11 @@ static DWORD WINAPI threadPlacar(LPVOID param) {
     /* DEBUG: Thread de placar iniciada para novo cliente */
     _tprintf(_T("[DEBUG] threadPlacar iniciada\n"));
     
+    /* Evento usado para esperar leituras assíncronas com timeout. */
     ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 
     while (!encerrar) {
-        /* PRIMEIRO: Processar fila de envio para este placar */
+        /* 1) Processar primeiro a fila de mensagens pendentes. */
         EnterCriticalSection(&csPlacares);
         { int idx = slotPorPipe(hPipe);
           if (idx >= 0) {
@@ -135,17 +153,18 @@ static DWORD WINAPI threadPlacar(LPVOID param) {
         }
         LeaveCriticalSection(&csPlacares);
         
-        /* DEPOIS: Aguardar próxima mensagem do placar com timeout */
+        /* 2) Aguardar nova mensagem do placar sem bloquear indefinidamente. */
         DWORD r;
         ResetEvent(ov.hEvent);
         if (!ReadFile(hPipe, &m, sizeof(MSG_ANY), &r, &ov)) {
             DWORD err = GetLastError();
             if (err == ERROR_IO_PENDING) {
-                /* Operação assíncrona em andamento, aguardar com timeout */
+                /* Leitura pendente: espera curta para voltar à fila de envio se necessário. */
                 DWORD waitRes = WaitForSingleObject(ov.hEvent, 100);  /* 100ms timeout */
                 if (waitRes == WAIT_TIMEOUT) {
                     continue;  /* Volta para processar fila novamente */
                 } else if (waitRes != WAIT_OBJECT_0) {
+                    /* Erro na espera: marcar o placar como desligado. */
                     EnterCriticalSection(&csPlacares);
                     { int idx = slotPorPipe(hPipe);
                       if (idx >= 0) {
@@ -158,10 +177,10 @@ static DWORD WINAPI threadPlacar(LPVOID param) {
                     LeaveCriticalSection(&csPlacares);
                     break;
                 }
-                /* Wait foi bem-sucedido, obter resultado */
+                /* Leitura concluída com sucesso: obter número de bytes. */
                 GetOverlappedResult(hPipe, &ov, &r, FALSE);
                 if (r == 0) {
-                    /* Conexão fechada */
+                    /* Pipe fechado pelo cliente. */
                     EnterCriticalSection(&csPlacares);
                     { int idx = slotPorPipe(hPipe);
                       if (idx >= 0) {
@@ -175,7 +194,7 @@ static DWORD WINAPI threadPlacar(LPVOID param) {
                     break;
                 }
             } else {
-                /* Erro na leitura */
+                /* Erro de leitura imediato. */
                 EnterCriticalSection(&csPlacares);
                 { int idx = slotPorPipe(hPipe);
                   if (idx >= 0) {
@@ -189,7 +208,7 @@ static DWORD WINAPI threadPlacar(LPVOID param) {
                 break;
             }
         } else if (r == 0) {
-            /* Conexão fechada */
+            /* Pipe fechado pelo cliente. */
             EnterCriticalSection(&csPlacares);
             { int idx = slotPorPipe(hPipe);
               if (idx >= 0) {
@@ -203,6 +222,7 @@ static DWORD WINAPI threadPlacar(LPVOID param) {
             break;
         }
 
+        /* 3) Processamento do protocolo de mensagens. */
         if (m.tipo == 1) {                       /* ligar */
             DWORD  id;
             MSG_ID mi;
@@ -224,6 +244,7 @@ static DWORD WINAPI threadPlacar(LPVOID param) {
               placares[idx].identificador = proximoId++;
               id = placares[idx].identificador; }
             LeaveCriticalSection(&csPlacares);
+            /* Resposta com o ID atribuído ao novo placar. */
             mi.tipo = 7; mi.identificador = id;
             { MSG_ANY m_temp; m_temp.id = mi; enviar(hPipe, &m_temp); }
             _tprintf(_T("[Central] Placar ligado: ID=%u\n"), id);
@@ -237,6 +258,7 @@ static DWORD WINAPI threadPlacar(LPVOID param) {
               id = (idx >= 0) ? placares[idx].identificador : 0;
               if (idx >= 0) { placares[idx].ativo = FALSE; placares[idx].hPipe = INVALID_HANDLE_VALUE; } }
             LeaveCriticalSection(&csPlacares);
+            /* Confirmação enviada antes de fechar o handle. */
             { MSG_ANY m_temp; m_temp.cmd.tipo = 2; enviar(hPipe, &m_temp); }
             _tprintf(_T("[Central] Placar %u desligado.\n"), id);
             CloseHandle(hPipe);
@@ -281,11 +303,13 @@ static DWORD WINAPI threadPlacar(LPVOID param) {
             LeaveCriticalSection(&csPlacares);
         }
     }
+    /* Limpeza do evento da operação assíncrona. */
     if (ov.hEvent) CloseHandle(ov.hEvent);
     return 0;
 }
 
-/* ---------- thread de aceitacao ---------- */
+/* ---------- thread de aceitação ----------
+   Fica responsável por aceitar novas ligações no named pipe. */
 
 static DWORD WINAPI threadAceitar(LPVOID param) {
     TCHAR fullName[300];
@@ -305,15 +329,16 @@ static DWORD WINAPI threadAceitar(LPVOID param) {
 
         ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 
+        /* Tentativa de aceitação assíncrona do cliente. */
         if (!ConnectNamedPipe(hPipe, &ov)) {
             DWORD err = GetLastError();
             if (err == ERROR_IO_PENDING) {
-                /* Aguardar ligação ou sinal de encerrar */
+                /* Espera pela ligação ou pelo pedido de encerramento global. */
                 waitHandles[0] = ov.hEvent;
                 waitHandles[1] = hEventoEncerrar;
                 DWORD waitRes = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
                 if (waitRes != WAIT_OBJECT_0) {
-                    /* encerrar sinalizado */
+                    /* Encerramento solicitado. */
                     CancelIo(hPipe);
                     CloseHandle(ov.hEvent);
                     CloseHandle(hPipe);
@@ -336,6 +361,7 @@ static DWORD WINAPI threadAceitar(LPVOID param) {
 
         if (encerrar) { CloseHandle(hPipe); break; }
 
+        /* Criar a thread dedicada ao novo placar. */
         { HANDLE ht = CreateThread(NULL, 0, threadPlacar, (LPVOID)hPipe, 0, NULL);
           /* DEBUG: Thread de placar criada */
           _tprintf(_T("[DEBUG] Nova thread de placar criada para handle %p\n"), hPipe);
@@ -344,8 +370,8 @@ static DWORD WINAPI threadAceitar(LPVOID param) {
     return 0;
 }
 
-/* ---------- comandos do administrador
-   Apenas fazem WriteFile — o ReadFile fica sempre na threadPlacar. ---------- */
+    /* ---------- comandos do administrador ----------
+       Estes comandos só escrevem na fila/pipe; a leitura fica na threadPlacar. */
 
 static void cmdAlerta(TCHAR* args) {
     TCHAR  buf[512], msg[MAX_MSG];
@@ -373,7 +399,7 @@ static void cmdAlerta(TCHAR* args) {
     _tcsncpy_s(ma.msg, MAX_MSG, msg, _TRUNCATE);
     ma.duracao = duracao;
 
-    /* Adicionar à fila dentro da critical section */
+    /* O alerta vai para todos os placares ou apenas para um ID específico. */
     _tprintf(_T("[DEBUG] Adicionando alerta à fila de envio\n"));
     EnterCriticalSection(&csPlacares);
     if (idPlacar == 0) {
@@ -381,14 +407,30 @@ static void cmdAlerta(TCHAR* args) {
         for (i = 0; i < MAX_PLACARES; i++) {
             if (!placares[i].ativo) continue;
             _tprintf(_T("[DEBUG] Adicionando à fila do placar index=%d\n"), i);
+            /* Se já existir alerta ativo, o novo alerta substitui o anterior. */
+            if (placares[i].temAlerta) {
+                MSG_ANY m_cancel; m_cancel.cmd.tipo = 5;
+                adicionarFilaEnvio(i, &m_cancel);
+            }
             adicionarFilaEnvio(i, (MSG_ANY*)&ma);
+            placares[i].temAlerta = TRUE;
+            _tcsncpy_s(placares[i].msgAlerta, MAX_MSG, ma.msg, _TRUNCATE);
+            placares[i].duracaoAlerta = ma.duracao;
         }
     } else {
         int idx = slotPorId(idPlacar);
         _tprintf(_T("[DEBUG] Procurando placar ID=%u, slot=%d\n"), idPlacar, idx);
         if (idx < 0) { LeaveCriticalSection(&csPlacares); _tprintf(_T("[Central] Placar %u nao existe.\n"), idPlacar); return; }
         _tprintf(_T("[DEBUG] Adicionado alerta à fila do placar ID=%u\n"), idPlacar);
+        /* Se já existir alerta ativo, o novo alerta substitui o anterior. */
+        if (placares[idx].temAlerta) {
+            MSG_ANY m_cancel; m_cancel.cmd.tipo = 5;
+            adicionarFilaEnvio(idx, &m_cancel);
+        }
         adicionarFilaEnvio(idx, (MSG_ANY*)&ma);
+        placares[idx].temAlerta = TRUE;
+        _tcsncpy_s(placares[idx].msgAlerta, MAX_MSG, ma.msg, _TRUNCATE);
+        placares[idx].duracaoAlerta = ma.duracao;
     }
     LeaveCriticalSection(&csPlacares);
     _tprintf(_T("[DEBUG] Alerta adicionado à fila com sucesso\n"));
@@ -402,7 +444,7 @@ static void cmdCancelar(TCHAR* args) {
     id = (DWORD)_ttoi(args);
     mc.tipo = 5;
     
-    /* Adicionar à fila dentro da critical section */
+    /* Só faz sentido cancelar se o placar existir e tiver alerta ativo. */
     EnterCriticalSection(&csPlacares);
     idx = slotPorId(id);
     if (idx < 0) { LeaveCriticalSection(&csPlacares); _tprintf(_T("[Central] Placar %u nao existe.\n"), id); return; }
@@ -412,6 +454,7 @@ static void cmdCancelar(TCHAR* args) {
     LeaveCriticalSection(&csPlacares);
 }
 
+/* Lista os placares ativos e o respetivo estado atual. */
 static void cmdListar(void) {
     int i, c = 0;
     EnterCriticalSection(&csPlacares);
@@ -429,6 +472,10 @@ static void cmdListar(void) {
     LeaveCriticalSection(&csPlacares);
 }
 
+/* Encerramento ordenado:
+    1) enfileira o comando de fecho;
+    2) dá tempo para as threads enviarem;
+    3) sinaliza a aceitação e limpa os handles. */
 static void cmdEncerrar(void) {
     int i; MSG_CMD mc; mc.tipo = 6;
     _tprintf(_T("[Central] A encerrar...\n"));
@@ -481,6 +528,7 @@ int _tmain(int argc, TCHAR* argv[]) {
     hEventoEncerrar = CreateEvent(NULL, TRUE, FALSE, NULL);
     hAceitar = CreateThread(NULL, 0, threadAceitar, NULL, 0, NULL);
 
+    /* Ciclo de comandos do administrador. */
     while (!encerrar) {
         TCHAR* esp; TCHAR* args; TCHAR* nl;
         _tprintf(_T("> "));
@@ -496,6 +544,7 @@ int _tmain(int argc, TCHAR* argv[]) {
         else if (!_tcsicmp(linha, _T("encerrar"))) { cmdEncerrar(); break; }
         else _tprintf(_T("Comando desconhecido.\n"));
     }
+    /* Espera curta para a thread de aceitação terminar após o encerramento. */
     WaitForSingleObject(hAceitar, 3000);
     CloseHandle(hAceitar);
     if (hEventoEncerrar) { CloseHandle(hEventoEncerrar); hEventoEncerrar = NULL; }

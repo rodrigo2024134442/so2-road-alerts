@@ -1,5 +1,11 @@
 // placar.c - SO2 2025/26 - M2
 // gcc -municode -DUNICODE -D_UNICODE -o placar.exe placar.c
+//
+// Papel do processo Placar:
+// - lê o nome do pipe do Registry ou da linha de comando;
+// - liga-se à Central via named pipe;
+// - recebe alertas/cancelamentos/encerramento;
+// - usa uma thread de receção e uma thread para o timer do alerta.
 #include <windows.h>
 #include <tchar.h>
 #include <stdio.h>
@@ -23,6 +29,7 @@ typedef union {
     MSG_ID     id;
 } MSG_ANY;
 
+/* Estado global do cliente (placar). */
 static HANDLE           hPipeCentral = INVALID_HANDLE_VALUE;
 static DWORD            identificador = 0;
 static BOOL             ligado    = FALSE;
@@ -34,8 +41,9 @@ static HANDLE           hThreadRecepcao = NULL;
 static CRITICAL_SECTION csEstado;
 static TCHAR            nomePipe[256];
 
-/* ---------- helpers ---------- */
+/* ---------- helpers de suporte ---------- */
 
+/* Formata a hora local para mostrar mensagens no ecrã. */
 static void formatarHora(TCHAR* buf, int sz) {
     SYSTEMTIME st; GetLocalTime(&st);
     _stprintf_s(buf, sz, _T("%02d/%02d/%04d (%02d:%02d:%02d)"),
@@ -43,6 +51,7 @@ static void formatarHora(TCHAR* buf, int sz) {
         st.wHour, st.wMinute, st.wSecond);
 }
 
+/* Lê o nome da pipe guardado no Registry. */
 static BOOL lerRegistry(TCHAR* out, DWORD outSz) {
     HKEY hKey; DWORD tipo, sz = outSz * sizeof(TCHAR);
     if (RegOpenKeyEx(HKEY_CURRENT_USER, REG_KEY, 0, KEY_READ, &hKey) != ERROR_SUCCESS) return FALSE;
@@ -50,6 +59,7 @@ static BOOL lerRegistry(TCHAR* out, DWORD outSz) {
       RegCloseKey(hKey); return ok; }
 }
 
+/* Guarda o nome da pipe no Registry para reutilização futura. */
 static void escreverRegistry(const TCHAR* val) {
     HKEY hKey;
     RegCreateKeyEx(HKEY_CURRENT_USER, REG_KEY, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL);
@@ -58,6 +68,7 @@ static void escreverRegistry(const TCHAR* val) {
     RegCloseKey(hKey);
 }
 
+/* Envia uma mensagem para a Central e mostra logs de debug. */
 static BOOL enviar(HANDLE h, const MSG_ANY* buf) {
     if (h == INVALID_HANDLE_VALUE) {
         _tprintf(_T("[DEBUG] enviar() - handle invalido, descartando tipo=%d\n"), buf->tipo);
@@ -72,6 +83,7 @@ static BOOL enviar(HANDLE h, const MSG_ANY* buf) {
     return result;
 }
 
+/* Recebe uma mensagem da Central com logs de debug. */
 static BOOL receberMsg(HANDLE h, MSG_ANY* out) {
     DWORD r;
     _tprintf(_T("[DEBUG] receberMsg() ENTRADA - aguardando leitura..., handle=%p\n"), h);
@@ -83,6 +95,7 @@ static BOOL receberMsg(HANDLE h, MSG_ANY* out) {
     return result;
 }
 
+/* Cancela e fecha o timer do alerta, se existir. */
 static void cancelarTimer(void) {
     if (hTimerAlerta) {
         CancelWaitableTimer(hTimerAlerta);
@@ -91,7 +104,8 @@ static void cancelarTimer(void) {
     }
 }
 
-/* ---------- thread do waitable timer ---------- */
+/* ---------- thread do waitable timer ----------
+    Esta thread acorda quando o alerta termina e avisa a Central. */
 
 typedef struct { HANDLE hTimer; } TIMER_PARAM;
 
@@ -99,6 +113,7 @@ static DWORD WINAPI threadTimer(LPVOID param) {
     TIMER_PARAM* tp = (TIMER_PARAM*)param;
     HANDLE hTimer = tp->hTimer;
     free(tp);
+    /* Espera até o timer expirar. */
     WaitForSingleObject(hTimer, INFINITE);
     EnterCriticalSection(&csEstado);
     if (temAlerta && !terminar) {
@@ -116,7 +131,8 @@ static DWORD WINAPI threadTimer(LPVOID param) {
     return 0;
 }
 
-/* ---------- thread de receção ---------- */
+/* ---------- thread de receção ----------
+    Recebe as mensagens da Central e atualiza o estado do placar. */
 
 static DWORD WINAPI threadRecepcao(LPVOID param) {
     MSG_ANY m;
@@ -125,25 +141,24 @@ static DWORD WINAPI threadRecepcao(LPVOID param) {
     /* DEBUG: Thread de receção iniciada */
     _tprintf(_T("[DEBUG] threadRecepcao iniciada\n"));
     
+    /* Evento usado para aguardar leituras overlapped com timeout curto. */
     ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 
     while (!terminar) {
-        /* Verificar se deve desligar */
+        /* Primeiro, verificar se a interface pediu desligar. */
         if (deveDesligar) {
             _tprintf(_T("[DEBUG] deveDesligar=TRUE, saindo\n"));
             fflush(stdout);
             terminar = TRUE;
             break;
         }
-        
-
-        
-        /* Overlapped ReadFile com timeout */
+        /* Leitura overlapped com timeout para não bloquear a interface. */
         DWORD r;
         ResetEvent(ov.hEvent);
         if (!ReadFile(hPipeCentral, &m, sizeof(MSG_ANY), &r, &ov)) {
             DWORD err = GetLastError();
             if (err == ERROR_IO_PENDING) {
+                /* A operação ainda não terminou; esperar um pouco e tentar de novo. */
                 DWORD waitRes = WaitForSingleObject(ov.hEvent, 100);
                 if (waitRes == WAIT_TIMEOUT) {
                     continue;  /* Volta para verificar deveDesligar */
@@ -179,7 +194,7 @@ static DWORD WINAPI threadRecepcao(LPVOID param) {
             _tprintf(_T("[DEBUG] >>>>>> NOVO ALERTA RECEBIDO (tipo=4) <<<<<<\n"));
             _tprintf(_T("[DEBUG] Mensagem: '%s'\n"), m.alerta.msg);
             _tprintf(_T("[DEBUG] Duracao: %u segundos\n"), m.alerta.duracao);
-            /* confirmar */
+            /* Confirmação do alerta enviada de volta à Central. */
             _tprintf(_T("[DEBUG] Enviando confirmacao de alerta (tipo=4)...\n"));
             enviar(hPipeCentral, &m);
             EnterCriticalSection(&csEstado);
@@ -222,8 +237,10 @@ static DWORD WINAPI threadRecepcao(LPVOID param) {
     return 0;
 }
 
-/* ---------- comandos do instalador ---------- */
+/* ---------- comandos do instalador ----------
+    A interface só precisa de dois comandos: ligar e desligar. */
 
+/* Liga o placar à Central, recebe o ID e arranca a thread de receção. */
 static void cmdLigar(void) {
     TCHAR fullName[300]; DWORD mode; MSG_CMD mc; MSG_ANY resp; HANDLE ht;
     /* DEBUG: Comando ligar executado */
@@ -260,6 +277,7 @@ static void cmdLigar(void) {
     _tprintf(_T("[DEBUG] threadRecepcao criada\n"));
 }
 
+/* Desliga de forma ordenada e espera a thread de receção terminar. */
 static void cmdDesligar(void) {
     if (!ligado) { _tprintf(_T("[Placar] Nao ligado.\n")); terminar = TRUE; return; }
     _tprintf(_T("[Placar] A desligar...\n"));
@@ -305,6 +323,7 @@ int _tmain(int argc, TCHAR* argv[]) {
     _tprintf(_T("Comandos: ligar | desligar\n\n"));
     InitializeCriticalSection(&csEstado);
 
+    /* Ciclo simples de comandos do utilizador. */
     while (!terminar) {
         TCHAR* nl;
         _tprintf(_T("> "));
