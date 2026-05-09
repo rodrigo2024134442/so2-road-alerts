@@ -10,6 +10,7 @@
 #include <tchar.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdarg.h>
 
 #define MAX_PLACARES 20
 #define MAX_MSG      140
@@ -49,6 +50,24 @@ static CRITICAL_SECTION csPlacares;
 static BOOL             encerrar  = FALSE;
 static HANDLE           hEventoEncerrar = NULL;
 static TCHAR            nomePipe[256];
+static BOOL             debugAtivo = FALSE; /* TRUE para mostrar logs [DEBUG] */
+
+/* Filtra logs de debug sem alterar o restante output da aplicação. */
+static int debugPrintf(const TCHAR* formato, ...) {
+    int resultado;
+    va_list args;
+
+    if (!debugAtivo && formato && _tcsncmp(formato, _T("[DEBUG]"), 7) == 0)
+        return 0;
+
+    va_start(args, formato);
+    resultado = _vtprintf(formato, args);
+    va_end(args);
+    return resultado;
+}
+
+#undef _tprintf
+#define _tprintf debugPrintf
 
 /* ---------- helpers de pesquisa/estado ---------- */
 
