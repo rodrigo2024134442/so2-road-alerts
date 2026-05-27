@@ -15,12 +15,27 @@
 #define MAX_PLACARES 20
 #define MAX_MSG      140
 #define PIPE_BUFFER  4096
+#define SHM_NAME     _T("SO2_SHM")
+#define SHM_MUTEX    _T("SO2_SHM_MTX")
+#define SHM_EVENT    _T("SO2_SHM_EVT")
 
 #pragma pack(push, 1)
-typedef struct { BYTE tipo;                                    } MSG_CMD;
+typedef struct { BYTE tipo; } MSG_CMD;
 typedef struct { BYTE tipo; TCHAR msg[MAX_MSG]; DWORD duracao; } MSG_ALERTA;
-typedef struct { BYTE tipo; DWORD identificador;               } MSG_ID;
+typedef struct { BYTE tipo; DWORD identificador; } MSG_ID;
 #pragma pack(pop)
+
+typedef struct {
+    DWORD identificador;
+    DWORD duracao;
+    TCHAR msg[MAX_MSG];
+} SHM_PLACAR;
+
+typedef struct {
+    SHM_PLACAR placar[MAX_PLACARES];
+    BOOL desligar;
+    DWORD seq;
+} SHM_ALERTA;
 
 typedef union {
     BYTE       tipo;
@@ -47,10 +62,16 @@ typedef struct {
 static PLACAR_INFO      placares[MAX_PLACARES];
 static DWORD            proximoId = 1;
 static CRITICAL_SECTION csPlacares;
-static BOOL             encerrar  = FALSE;
+static BOOL             encerrar = FALSE;
 static HANDLE           hEventoEncerrar = NULL;
+static HANDLE           hMutexCentral = NULL;
 static TCHAR            nomePipe[256];
 static BOOL             debugAtivo = FALSE; /* TRUE para mostrar logs [DEBUG] */
+
+static HANDLE           hMapFile = NULL;
+static HANDLE           hMutexShm = NULL;
+static HANDLE           hEventShm = NULL;
+static SHM_ALERTA*      shm = NULL;
 
 /* Filtra logs de debug sem alterar o restante output da aplicação. */
 static int debugPrintf(const TCHAR* formato, ...) {
@@ -70,6 +91,67 @@ static int debugPrintf(const TCHAR* formato, ...) {
 #define _tprintf debugPrintf
 
 /* ---------- helpers de pesquisa/estado ---------- */
+
+/* Inicializa os recursos de memoria partilhada para monitor. */
+static BOOL iniciarShm(void) {
+    hMapFile = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
+        sizeof(SHM_ALERTA), SHM_NAME);
+    if (!hMapFile) return FALSE;
+    shm = (SHM_ALERTA*)MapViewOfFile(hMapFile, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SHM_ALERTA));
+    if (!shm) return FALSE;
+    hMutexShm = CreateMutex(NULL, FALSE, SHM_MUTEX);
+    if (!hMutexShm) return FALSE;
+    hEventShm = CreateEvent(NULL, TRUE, FALSE, SHM_EVENT);
+    if (!hEventShm) return FALSE;
+
+    WaitForSingleObject(hMutexShm, INFINITE);
+    memset(shm, 0, sizeof(SHM_ALERTA));
+    ReleaseMutex(hMutexShm);
+    return TRUE;
+}
+
+static void sinalizarShm(void) {
+    if (hEventShm) SetEvent(hEventShm);
+}
+
+static void atualizarShmSlot(int idx) {
+    if (!shm || !hMutexShm || idx < 0 || idx >= MAX_PLACARES) return;
+    WaitForSingleObject(hMutexShm, INFINITE);
+    if (placares[idx].ativo && placares[idx].temAlerta) {
+        shm->placar[idx].identificador = placares[idx].identificador;
+        shm->placar[idx].duracao = placares[idx].duracaoAlerta;
+        _tcsncpy_s(shm->placar[idx].msg, MAX_MSG, placares[idx].msgAlerta, _TRUNCATE);
+    }
+    else {
+        shm->placar[idx].identificador = 0;
+        shm->placar[idx].duracao = 0;
+        shm->placar[idx].msg[0] = _T('\0');
+    }
+    shm->seq++;
+    ReleaseMutex(hMutexShm);
+    sinalizarShm();
+}
+
+static void atualizarShmAll(void) {
+    int i;
+    if (!shm || !hMutexShm) return;
+    WaitForSingleObject(hMutexShm, INFINITE);
+    for (i = 0; i < MAX_PLACARES; i++) {
+        if (placares[i].ativo && placares[i].temAlerta) {
+            shm->placar[i].identificador = placares[i].identificador;
+            shm->placar[i].duracao = placares[i].duracaoAlerta;
+            _tcsncpy_s(shm->placar[i].msg, MAX_MSG, placares[i].msgAlerta, _TRUNCATE);
+        }
+        else {
+            shm->placar[i].identificador = 0;
+            shm->placar[i].duracao = 0;
+            shm->placar[i].msg[0] = _T('\0');
+        }
+    }
+    shm->seq++;
+    ReleaseMutex(hMutexShm);
+    sinalizarShm();
+}
 
 /* Procura um placar pelo handle do pipe associado. */
 static int slotPorPipe(HANDLE h) {
@@ -145,33 +227,34 @@ static BOOL receberMsg(HANDLE h, MSG_ANY* out) {
 static DWORD WINAPI threadPlacar(LPVOID param) {
     HANDLE  hPipe = (HANDLE)param;
     MSG_ANY m;
-    OVERLAPPED ov = {0};
+    OVERLAPPED ov = { 0 };
     /* DEBUG: Thread de placar iniciada para novo cliente */
     _tprintf(_T("[DEBUG] threadPlacar iniciada\n"));
-    
+
     /* Evento usado para esperar leituras assíncronas com timeout. */
     ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 
     while (!encerrar) {
         /* 1) Processar primeiro a fila de mensagens pendentes. */
         EnterCriticalSection(&csPlacares);
-        { int idx = slotPorPipe(hPipe);
-          if (idx >= 0) {
-              while (placares[idx].filaInicio != placares[idx].filaFim) {
-                  MSG_ANY filaMsg = placares[idx].filaEnvio[placares[idx].filaInicio];
-                  placares[idx].filaInicio = (placares[idx].filaInicio + 1) % 50;
-                  ResetEvent(placares[idx].hEventoFila);
-                  LeaveCriticalSection(&csPlacares);
-                  _tprintf(_T("[DEBUG] Enviando fila: tipo=%d, handle=%p\n"), filaMsg.tipo, hPipe);
-                  enviar(hPipe, &filaMsg);
-                  EnterCriticalSection(&csPlacares);
-                  idx = slotPorPipe(hPipe);
-                  if (idx < 0) break;  /* placar desligou */
-              }
-          }
+        {
+            int idx = slotPorPipe(hPipe);
+            if (idx >= 0) {
+                while (placares[idx].filaInicio != placares[idx].filaFim) {
+                    MSG_ANY filaMsg = placares[idx].filaEnvio[placares[idx].filaInicio];
+                    placares[idx].filaInicio = (placares[idx].filaInicio + 1) % 50;
+                    ResetEvent(placares[idx].hEventoFila);
+                    LeaveCriticalSection(&csPlacares);
+                    _tprintf(_T("[DEBUG] Enviando fila: tipo=%d, handle=%p\n"), filaMsg.tipo, hPipe);
+                    enviar(hPipe, &filaMsg);
+                    EnterCriticalSection(&csPlacares);
+                    idx = slotPorPipe(hPipe);
+                    if (idx < 0) break;  /* placar desligou */
+                }
+            }
         }
         LeaveCriticalSection(&csPlacares);
-        
+
         /* 2) Aguardar nova mensagem do placar sem bloquear indefinidamente. */
         DWORD r;
         ResetEvent(ov.hEvent);
@@ -182,17 +265,21 @@ static DWORD WINAPI threadPlacar(LPVOID param) {
                 DWORD waitRes = WaitForSingleObject(ov.hEvent, 100);  /* 100ms timeout */
                 if (waitRes == WAIT_TIMEOUT) {
                     continue;  /* Volta para processar fila novamente */
-                } else if (waitRes != WAIT_OBJECT_0) {
+                }
+                else if (waitRes != WAIT_OBJECT_0) {
                     /* Erro na espera: marcar o placar como desligado. */
                     EnterCriticalSection(&csPlacares);
-                    { int idx = slotPorPipe(hPipe);
-                      if (idx >= 0) {
-                          _tprintf(_T("[Central] Placar %u perdeu ligacao (wait erro).\n"), placares[idx].identificador);
-                          placares[idx].ativo = FALSE;
-                          if (placares[idx].hEventoFila) { CloseHandle(placares[idx].hEventoFila); placares[idx].hEventoFila = NULL; }
-                          CloseHandle(placares[idx].hPipe);
-                          placares[idx].hPipe = INVALID_HANDLE_VALUE;
-                      } }
+                    {
+                        int idx = slotPorPipe(hPipe);
+                        if (idx >= 0) {
+                            _tprintf(_T("[Central] Placar %u perdeu ligacao (wait erro).\n"), placares[idx].identificador);
+                            placares[idx].ativo = FALSE;
+                            atualizarShmSlot(idx);
+                            if (placares[idx].hEventoFila) { CloseHandle(placares[idx].hEventoFila); placares[idx].hEventoFila = NULL; }
+                            CloseHandle(placares[idx].hPipe);
+                            placares[idx].hPipe = INVALID_HANDLE_VALUE;
+                        }
+                    }
                     LeaveCriticalSection(&csPlacares);
                     break;
                 }
@@ -201,42 +288,53 @@ static DWORD WINAPI threadPlacar(LPVOID param) {
                 if (r == 0) {
                     /* Pipe fechado pelo cliente. */
                     EnterCriticalSection(&csPlacares);
-                    { int idx = slotPorPipe(hPipe);
-                      if (idx >= 0) {
-                          _tprintf(_T("[Central] Placar %u perdeu ligacao.\n"), placares[idx].identificador);
-                          placares[idx].ativo = FALSE;
-                          if (placares[idx].hEventoFila) { CloseHandle(placares[idx].hEventoFila); placares[idx].hEventoFila = NULL; }
-                          CloseHandle(placares[idx].hPipe);
-                          placares[idx].hPipe = INVALID_HANDLE_VALUE;
-                      } }
+                    {
+                        int idx = slotPorPipe(hPipe);
+                        if (idx >= 0) {
+                            _tprintf(_T("[Central] Placar %u perdeu ligacao.\n"), placares[idx].identificador);
+                            placares[idx].ativo = FALSE;
+                            atualizarShmSlot(idx);
+                            if (placares[idx].hEventoFila) { CloseHandle(placares[idx].hEventoFila); placares[idx].hEventoFila = NULL; }
+                            CloseHandle(placares[idx].hPipe);
+                            placares[idx].hPipe = INVALID_HANDLE_VALUE;
+                        }
+                    }
                     LeaveCriticalSection(&csPlacares);
                     break;
                 }
-            } else {
+            }
+            else {
                 /* Erro de leitura imediato. */
                 EnterCriticalSection(&csPlacares);
-                { int idx = slotPorPipe(hPipe);
-                  if (idx >= 0) {
-                      _tprintf(_T("[Central] Placar %u perdeu ligacao (erro=%u).\n"), placares[idx].identificador, err);
-                      placares[idx].ativo = FALSE;
-                      if (placares[idx].hEventoFila) { CloseHandle(placares[idx].hEventoFila); placares[idx].hEventoFila = NULL; }
-                      CloseHandle(placares[idx].hPipe);
-                      placares[idx].hPipe = INVALID_HANDLE_VALUE;
-                  } }
+                {
+                    int idx = slotPorPipe(hPipe);
+                    if (idx >= 0) {
+                        _tprintf(_T("[Central] Placar %u perdeu ligacao (erro=%u).\n"), placares[idx].identificador, err);
+                        placares[idx].ativo = FALSE;
+                        atualizarShmSlot(idx);
+                        if (placares[idx].hEventoFila) { CloseHandle(placares[idx].hEventoFila); placares[idx].hEventoFila = NULL; }
+                        CloseHandle(placares[idx].hPipe);
+                        placares[idx].hPipe = INVALID_HANDLE_VALUE;
+                    }
+                }
                 LeaveCriticalSection(&csPlacares);
                 break;
             }
-        } else if (r == 0) {
+        }
+        else if (r == 0) {
             /* Pipe fechado pelo cliente. */
             EnterCriticalSection(&csPlacares);
-            { int idx = slotPorPipe(hPipe);
-              if (idx >= 0) {
-                  _tprintf(_T("[Central] Placar %u perdeu ligacao.\n"), placares[idx].identificador);
-                  placares[idx].ativo = FALSE;
-                  if (placares[idx].hEventoFila) { CloseHandle(placares[idx].hEventoFila); placares[idx].hEventoFila = NULL; }
-                  CloseHandle(placares[idx].hPipe);
-                  placares[idx].hPipe = INVALID_HANDLE_VALUE;
-              } }
+            {
+                int idx = slotPorPipe(hPipe);
+                if (idx >= 0) {
+                    _tprintf(_T("[Central] Placar %u perdeu ligacao.\n"), placares[idx].identificador);
+                    placares[idx].ativo = FALSE;
+                    atualizarShmSlot(idx);
+                    if (placares[idx].hEventoFila) { CloseHandle(placares[idx].hEventoFila); placares[idx].hEventoFila = NULL; }
+                    CloseHandle(placares[idx].hPipe);
+                    placares[idx].hPipe = INVALID_HANDLE_VALUE;
+                }
+            }
             LeaveCriticalSection(&csPlacares);
             break;
         }
@@ -248,34 +346,40 @@ static DWORD WINAPI threadPlacar(LPVOID param) {
             /* DEBUG: Recebida mensagem de ligação (tipo=1) */
             _tprintf(_T("[DEBUG] Mensagem tipo 1 (ligar) recebida\n"));
             EnterCriticalSection(&csPlacares);
-            { int idx = slotLivre();
-              if (idx < 0) {
-                  LeaveCriticalSection(&csPlacares);
-                  _tprintf(_T("[Central] Sem slots!\n"));
-                  CloseHandle(hPipe); return 0;
-              }
-              placares[idx].ativo         = TRUE;
-              placares[idx].hPipe         = hPipe;
-              placares[idx].temAlerta     = FALSE;
-              placares[idx].filaInicio    = 0;
-              placares[idx].filaFim       = 0;
-              placares[idx].hEventoFila   = CreateEvent(NULL, TRUE, FALSE, NULL);
-              placares[idx].identificador = proximoId++;
-              id = placares[idx].identificador; }
+            {
+                int idx = slotLivre();
+                if (idx < 0) {
+                    LeaveCriticalSection(&csPlacares);
+                    _tprintf(_T("[Central] Sem slots!\n"));
+                    CloseHandle(hPipe); return 0;
+                }
+                placares[idx].ativo = TRUE;
+                placares[idx].hPipe = hPipe;
+                placares[idx].temAlerta = FALSE;
+                placares[idx].filaInicio = 0;
+                placares[idx].filaFim = 0;
+                placares[idx].hEventoFila = CreateEvent(NULL, TRUE, FALSE, NULL);
+                placares[idx].identificador = proximoId++;
+                id = placares[idx].identificador;
+            }
             LeaveCriticalSection(&csPlacares);
             /* Resposta com o ID atribuído ao novo placar. */
             mi.tipo = 7; mi.identificador = id;
             { MSG_ANY m_temp; m_temp.id = mi; enviar(hPipe, &m_temp); }
             _tprintf(_T("[Central] Placar ligado: ID=%u\n"), id);
 
-        } else if (m.tipo == 2) {                /* desligar */
+        }
+        else if (m.tipo == 2) {                /* desligar */
             DWORD id;
             /* DEBUG: Recebida mensagem de desligação (tipo=2) */
             _tprintf(_T("[DEBUG] Mensagem tipo 2 (desligar) recebida\n"));
             EnterCriticalSection(&csPlacares);
-            { int idx = slotPorPipe(hPipe);
-              id = (idx >= 0) ? placares[idx].identificador : 0;
-              if (idx >= 0) { placares[idx].ativo = FALSE; placares[idx].hPipe = INVALID_HANDLE_VALUE; } }
+            {
+                int idx = slotPorPipe(hPipe);
+                id = (idx >= 0) ? placares[idx].identificador : 0;
+                if (idx >= 0) { placares[idx].ativo = FALSE; placares[idx].hPipe = INVALID_HANDLE_VALUE; }
+                if (idx >= 0) { atualizarShmSlot(idx); }
+            }
             LeaveCriticalSection(&csPlacares);
             /* Confirmação enviada antes de fechar o handle. */
             { MSG_ANY m_temp; m_temp.cmd.tipo = 2; enviar(hPipe, &m_temp); }
@@ -283,42 +387,54 @@ static DWORD WINAPI threadPlacar(LPVOID param) {
             CloseHandle(hPipe);
             return 0;
 
-        } else if (m.tipo == 3) {                /* fim do alerta */
+        }
+        else if (m.tipo == 3) {                /* fim do alerta */
             /* DEBUG: Recebida mensagem de fim de alerta (tipo=3) */
             _tprintf(_T("[DEBUG] Mensagem tipo 3 (fim alerta) recebida\n"));
             EnterCriticalSection(&csPlacares);
-            { int idx = slotPorPipe(hPipe);
-              if (idx >= 0) {
-                  placares[idx].temAlerta = FALSE;
-                  _tprintf(_T("[Central] Placar %u: alerta terminou.\n"),
-                           placares[idx].identificador);
-              } }
+            {
+                int idx = slotPorPipe(hPipe);
+                if (idx >= 0) {
+                    placares[idx].temAlerta = FALSE;
+                    _tprintf(_T("[Central] Placar %u: alerta terminou.\n"),
+                        placares[idx].identificador);
+                    atualizarShmSlot(idx);
+                }
+            }
             LeaveCriticalSection(&csPlacares);
 
-        } else if (m.tipo == 4) {                /* confirmacao de alerta */
+        }
+        else if (m.tipo == 4) {                /* confirmacao de alerta */
             /* DEBUG: Recebida confirmação de alerta (tipo=4) */
             _tprintf(_T("[DEBUG] Mensagem tipo 4 (confirmacao alerta) recebida\n"));
             EnterCriticalSection(&csPlacares);
-            { int idx = slotPorPipe(hPipe);
-              if (idx >= 0) {
-                  placares[idx].temAlerta = TRUE;
-                  _tcsncpy_s(placares[idx].msgAlerta, MAX_MSG, m.alerta.msg, _TRUNCATE);
-                  placares[idx].duracaoAlerta = m.alerta.duracao;
-                  _tprintf(_T("[Central] Placar %u confirmou alerta.\n"),
-                           placares[idx].identificador);
-              } }
+            {
+                int idx = slotPorPipe(hPipe);
+                if (idx >= 0) {
+                    placares[idx].temAlerta = TRUE;
+                    _tcsncpy_s(placares[idx].msgAlerta, MAX_MSG, m.alerta.msg, _TRUNCATE);
+                    placares[idx].duracaoAlerta = m.alerta.duracao;
+                    _tprintf(_T("[Central] Placar %u confirmou alerta.\n"),
+                        placares[idx].identificador);
+                    atualizarShmSlot(idx);
+                }
+            }
             LeaveCriticalSection(&csPlacares);
 
-        } else if (m.tipo == 5) {                /* confirmacao de cancelamento */
+        }
+        else if (m.tipo == 5) {                /* confirmacao de cancelamento */
             /* DEBUG: Recebida confirmação de cancelamento (tipo=5) */
             _tprintf(_T("[DEBUG] Mensagem tipo 5 (confirmacao cancelamento) recebida\n"));
             EnterCriticalSection(&csPlacares);
-            { int idx = slotPorPipe(hPipe);
-              if (idx >= 0) {
-                  placares[idx].temAlerta = FALSE;
-                  _tprintf(_T("[Central] Placar %u confirmou cancelamento.\n"),
-                           placares[idx].identificador);
-              } }
+            {
+                int idx = slotPorPipe(hPipe);
+                if (idx >= 0) {
+                    placares[idx].temAlerta = FALSE;
+                    _tprintf(_T("[Central] Placar %u confirmou cancelamento.\n"),
+                        placares[idx].identificador);
+                    atualizarShmSlot(idx);
+                }
+            }
             LeaveCriticalSection(&csPlacares);
         }
     }
@@ -336,7 +452,7 @@ static DWORD WINAPI threadAceitar(LPVOID param) {
     _stprintf_s(fullName, 300, _T("\\\\.\\pipe\\%s"), nomePipe);
 
     while (!encerrar) {
-        OVERLAPPED ov = {0};
+        OVERLAPPED ov = { 0 };
         HANDLE waitHandles[2];
 
         HANDLE hPipe = CreateNamedPipe(
@@ -370,7 +486,8 @@ static DWORD WINAPI threadAceitar(LPVOID param) {
                     CloseHandle(hPipe);
                     continue;
                 }
-            } else if (err != ERROR_PIPE_CONNECTED) {
+            }
+            else if (err != ERROR_PIPE_CONNECTED) {
                 CloseHandle(ov.hEvent);
                 CloseHandle(hPipe);
                 continue;
@@ -381,16 +498,18 @@ static DWORD WINAPI threadAceitar(LPVOID param) {
         if (encerrar) { CloseHandle(hPipe); break; }
 
         /* Criar a thread dedicada ao novo placar. */
-        { HANDLE ht = CreateThread(NULL, 0, threadPlacar, (LPVOID)hPipe, 0, NULL);
-          /* DEBUG: Thread de placar criada */
-          _tprintf(_T("[DEBUG] Nova thread de placar criada para handle %p\n"), hPipe);
-          if (ht) CloseHandle(ht); }
+        {
+            HANDLE ht = CreateThread(NULL, 0, threadPlacar, (LPVOID)hPipe, 0, NULL);
+            /* DEBUG: Thread de placar criada */
+            _tprintf(_T("[DEBUG] Nova thread de placar criada para handle %p\n"), hPipe);
+            if (ht) CloseHandle(ht);
+        }
     }
     return 0;
 }
 
-    /* ---------- comandos do administrador ----------
-       Estes comandos só escrevem na fila/pipe; a leitura fica na threadPlacar. */
+/* ---------- comandos do administrador ----------
+   Estes comandos só escrevem na fila/pipe; a leitura fica na threadPlacar. */
 
 static void cmdAlerta(TCHAR* args) {
     TCHAR  buf[512], msg[MAX_MSG];
@@ -407,10 +526,10 @@ static void cmdAlerta(TCHAR* args) {
     while (tok && n < 128) { tokens[n++] = tok; tok = _tcstok_s(NULL, _T(" \t"), &ctx); }
     if (n < 3) { _tprintf(_T("Uso: alerta <msg> <duracao> <id|0>\n")); return; }
 
-    idPlacar = (DWORD)_ttoi(tokens[n-1]);
-    duracao  = (DWORD)_ttoi(tokens[n-2]);
+    idPlacar = (DWORD)_ttoi(tokens[n - 1]);
+    duracao = (DWORD)_ttoi(tokens[n - 2]);
     msg[0] = _T('\0');
-    for (i = 0; i < n-2; i++) {
+    for (i = 0; i < n - 2; i++) {
         if (i) _tcscat_s(msg, MAX_MSG, _T(" "));
         _tcscat_s(msg, MAX_MSG, tokens[i]);
     }
@@ -436,7 +555,8 @@ static void cmdAlerta(TCHAR* args) {
             _tcsncpy_s(placares[i].msgAlerta, MAX_MSG, ma.msg, _TRUNCATE);
             placares[i].duracaoAlerta = ma.duracao;
         }
-    } else {
+    }
+    else {
         int idx = slotPorId(idPlacar);
         _tprintf(_T("[DEBUG] Procurando placar ID=%u, slot=%d\n"), idPlacar, idx);
         if (idx < 0) { LeaveCriticalSection(&csPlacares); _tprintf(_T("[Central] Placar %u nao existe.\n"), idPlacar); return; }
@@ -453,23 +573,24 @@ static void cmdAlerta(TCHAR* args) {
     }
     LeaveCriticalSection(&csPlacares);
     _tprintf(_T("[DEBUG] Alerta adicionado à fila com sucesso\n"));
+    atualizarShmAll();
 }
 
 static void cmdCancelar(TCHAR* args) {
-    DWORD id; int idx; MSG_CMD mc;
+    DWORD id; int idx; MSG_ANY mc;
     /* DEBUG: Comando cancelar recebido */
     _tprintf(_T("[DEBUG] Comando cancelar: args='%s'\n"), args ? args : _T("(null)"));
     if (!args || !_tcslen(args)) { _tprintf(_T("Uso: cancelar <id>\n")); return; }
     id = (DWORD)_ttoi(args);
-    mc.tipo = 5;
-    
+    mc.cmd.tipo = 5;
+
     /* Só faz sentido cancelar se o placar existir e tiver alerta ativo. */
     EnterCriticalSection(&csPlacares);
     idx = slotPorId(id);
     if (idx < 0) { LeaveCriticalSection(&csPlacares); _tprintf(_T("[Central] Placar %u nao existe.\n"), id); return; }
     if (!placares[idx].temAlerta) { LeaveCriticalSection(&csPlacares); _tprintf(_T("[Central] Placar %u sem alerta.\n"), id); return; }
     _tprintf(_T("[DEBUG] Adicionado cancelamento à fila do placar ID=%u\n"), id);
-    adicionarFilaEnvio(idx, (MSG_ANY*)&mc);
+    adicionarFilaEnvio(idx, &mc);
     LeaveCriticalSection(&csPlacares);
 }
 
@@ -515,6 +636,13 @@ static void cmdEncerrar(void) {
     /* Agora setar encerrar e sinalizar threadAceitar */
     encerrar = TRUE;
     if (hEventoEncerrar) SetEvent(hEventoEncerrar);
+    if (shm && hMutexShm) {
+        WaitForSingleObject(hMutexShm, INFINITE);
+        shm->desligar = TRUE;
+        shm->seq++;
+        ReleaseMutex(hMutexShm);
+        sinalizarShm();
+    }
 
     /* Fechar handles dos placares ainda ativos */
     EnterCriticalSection(&csPlacares);
@@ -539,11 +667,30 @@ int _tmain(int argc, TCHAR* argv[]) {
     if (argc < 2) { _tprintf(_T("Uso: central.exe <nome_pipe>\n")); return 1; }
     _tcsncpy_s(nomePipe, 256, argv[1], _TRUNCATE);
     _tprintf(_T("[Central] Named pipe: \\\\.\\pipe\\%s\n"), nomePipe);
+    /* Verificar se já existe outra instância da central com este nome de pipe */
+    {
+        TCHAR mutexName[300];
+        _stprintf_s(mutexName, 300, _T("SO2_Central_%s"), nomePipe);
+        hMutexCentral = CreateMutex(NULL, FALSE, mutexName);
+        if (hMutexCentral == NULL) {
+            _tprintf(_T("[Central] Erro ao criar mutex de instância: %u\n"), GetLastError());
+            return 1;
+        }
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            _tprintf(_T("[Central] Outra instância da central já está a correr para '%s'.\n"), nomePipe);
+            CloseHandle(hMutexCentral);
+            return 1;
+        }
+    }
     _tprintf(_T("Comandos: alerta <msg> <dur> <id|0>  cancelar <id>  listar  encerrar\n\n"));
 
     memset(placares, 0, sizeof(placares));
     for (i = 0; i < MAX_PLACARES; i++) placares[i].hPipe = INVALID_HANDLE_VALUE;
     InitializeCriticalSection(&csPlacares);
+    if (!iniciarShm()) {
+        _tprintf(_T("[Central] Erro ao iniciar SHM do monitor.\n"));
+        return 1;
+    }
     hEventoEncerrar = CreateEvent(NULL, TRUE, FALSE, NULL);
     hAceitar = CreateThread(NULL, 0, threadAceitar, NULL, 0, NULL);
 
@@ -555,9 +702,9 @@ int _tmain(int argc, TCHAR* argv[]) {
         nl = _tcschr(linha, _T('\n')); if (nl) *nl = _T('\0');
         if (!_tcslen(linha)) continue;
         esp = _tcschr(linha, _T(' ')); args = NULL;
-        if (esp) { *esp = _T('\0'); args = esp+1; while(*args==_T(' ')) args++; }
+        if (esp) { *esp = _T('\0'); args = esp + 1; while (*args == _T(' ')) args++; }
 
-        if      (!_tcsicmp(linha, _T("alerta")))   cmdAlerta(args);
+        if (!_tcsicmp(linha, _T("alerta")))   cmdAlerta(args);
         else if (!_tcsicmp(linha, _T("cancelar"))) cmdCancelar(args);
         else if (!_tcsicmp(linha, _T("listar")))   cmdListar();
         else if (!_tcsicmp(linha, _T("encerrar"))) { cmdEncerrar(); break; }
@@ -568,5 +715,10 @@ int _tmain(int argc, TCHAR* argv[]) {
     CloseHandle(hAceitar);
     if (hEventoEncerrar) { CloseHandle(hEventoEncerrar); hEventoEncerrar = NULL; }
     DeleteCriticalSection(&csPlacares);
+    if (hMutexCentral) { CloseHandle(hMutexCentral); hMutexCentral = NULL; }
+    if (shm) { UnmapViewOfFile(shm); shm = NULL; }
+    if (hMapFile) { CloseHandle(hMapFile); hMapFile = NULL; }
+    if (hMutexShm) { CloseHandle(hMutexShm); hMutexShm = NULL; }
+    if (hEventShm) { CloseHandle(hEventShm); hEventShm = NULL; }
     return 0;
 }

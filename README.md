@@ -38,7 +38,25 @@ Ordem típica:
 2. Executar um ou mais **placares**
 3. Executar o **monitor** (opcional)
 
+## 🧪 Compilacao rapida (Windows + MinGW)
+
+```bash
+gcc -municode -DUNICODE -D_UNICODE -o central.exe central.c
+gcc -municode -DUNICODE -D_UNICODE -o placar.exe placar.c
+gcc -municode -DUNICODE -D_UNICODE -o monitor.exe monitor.c -lcomctl32 -lgdi32
+```
+
+## ✅ Entrega M3 (31 maio)
+
+- Monitor Win32 com menu "Ficheiro" (Configuracao/Acerca/Sair)
+- Lista de alertas ativos (ID, mensagem, duracao)
+- Paginacao com Page Up / Page Down
+- Memoria partilhada (SHM) e sincronizacao com mutex + evento
+- Atualizacao imediata sem polling
+
+Defesa individual presencial (oral): nao
+
 ## 👥 Autores
 
-* Nome 1 - João Carlos Lopes Marques
-* Nome 2 - Rodrigo Beja da Costa
+* Nome 1 - Joao Carlos Lopes Marques (2024132275)
+* Nome 2 - Rodrigo Beja da Costa (2024134442)
