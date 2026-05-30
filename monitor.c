@@ -128,6 +128,10 @@ static void atualizarLista(void) {
     TCHAR buf[64];
 
     copiarAlertas(ativos, &total, &desligar);
+
+    static int ultimoTotal = -1;
+    if (total != ultimoTotal) { g_page = 0; ultimoTotal = total; }
+    
     if (desligar) {
         debugLog(_T("[MON] desligar=TRUE, a terminar"));
         MessageBox(g_hwndMain, _T("A central encerrou. A terminar..."), _T("Monitor"), MB_OK | MB_ICONINFORMATION);

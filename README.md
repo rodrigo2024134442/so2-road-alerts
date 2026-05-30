@@ -54,7 +54,7 @@ gcc -municode -DUNICODE -D_UNICODE -o monitor.exe monitor.c -lcomctl32 -lgdi32
 - Memoria partilhada (SHM) e sincronizacao com mutex + evento
 - Atualizacao imediata sem polling
 
-Defesa individual presencial (oral): nao
+Defesa individual presencial (oral): Não
 
 ## 👥 Autores
 
