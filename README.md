@@ -1,62 +1,46 @@
-# Placar Informativo
+# Road Alert Broadcasting Platform
 
-Projeto desenvolvido no âmbito da unidade curricular de Sistemas Operativos 2 (2025/26).
+A platform for broadcasting road traffic alerts to information panels, built in **C on the Windows API** around inter-process communication.
+Developed for **Operating Systems 2** at ISEC - Polytechnic University of Coimbra (2025/26).
 
-## 📌 Descrição
+## Architecture
 
-Este projeto consiste na implementação de uma plataforma de divulgação de alertas para vias rodoviárias, baseada em comunicação entre processos.
+The system is made of three independent programs:
 
-A plataforma é composta por três programas principais:
+| Program | Role |
+|---|---|
+| `central` | Manages the system: receives, stores and distributes active alerts |
+| `placar` | An information panel that shows the alerts it receives (several can run at once) |
+| `monitor` | Win32 GUI that shows every active alert in real time |
 
-* **Central** – responsável pela gestão do sistema
-* **Placar** – representa os painéis informativos
-* **Monitor** – interface gráfica para visualização dos alertas
+## Features
 
-## ⚙️ Tecnologias utilizadas
+- Communication between processes through **named pipes**
+- **Shared memory** for the alert list, synchronised with **mutexes and events**
+- Multithreaded programs, with immediate updates and no polling
+- Win32 monitor with a File menu (Settings / About / Exit), an alert list (ID, message, duration) and paging with Page Up / Page Down
 
-* Linguagem C/C++
-* Windows API
-* Named Pipes
-* Memória Partilhada
-* Threads
+## Tech
 
-## 📂 Estrutura do projeto
+C, Windows API (Win32), named pipes, shared memory, threads, mutexes, events
 
-* `central/` – programa central
-* `placar/` – programa dos placares
-* `monitor/` – programa de monitorização
-* `common/` – estruturas e definições partilhadas
-* `docs/` – documentação e apontamentos
+## Build (Windows + MinGW)
 
-## 🚀 Execução
-
-Cada programa deve ser executado em consola independente.
-
-Ordem típica:
-
-1. Executar o **central**
-2. Executar um ou mais **placares**
-3. Executar o **monitor** (opcional)
-
-## 🧪 Compilacao rapida (Windows + MinGW)
-
-```bash
+```
 gcc -municode -DUNICODE -D_UNICODE -o central.exe central.c
 gcc -municode -DUNICODE -D_UNICODE -o placar.exe placar.c
 gcc -municode -DUNICODE -D_UNICODE -o monitor.exe monitor.c -lcomctl32 -lgdi32
 ```
 
-## ✅ Entrega M3 (31 maio)
+## Run
 
-- Monitor Win32 com menu "Ficheiro" (Configuracao/Acerca/Sair)
-- Lista de alertas ativos (ID, mensagem, duracao)
-- Paginacao com Page Up / Page Down
-- Memoria partilhada (SHM) e sincronizacao com mutex + evento
-- Atualizacao imediata sem polling
+Run each program in its own console, in this order:
 
-Defesa individual presencial (oral): Não
+1. `central`
+2. one or more `placar`
+3. `monitor` (optional)
 
-## 👥 Autores
+## Authors
 
-* Nome 1 - Joao Carlos Lopes Marques (2024132275)
-* Nome 2 - Rodrigo Beja da Costa (2024134442)
+- Rodrigo Costa ([@rodrigo2024134442](https://github.com/rodrigo2024134442))
+- Joao Marques ([@joao16marques](https://github.com/joao16marques))
